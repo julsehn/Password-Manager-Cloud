@@ -1,0 +1,25 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "cd password-manager-cloud && pip install --no-cache-dir -r requirements.txt",
+    "startCommand": "cd password-manager-cloud && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2",
+    "installCommand": "cd password-manager-cloud && pip install --no-cache-dir -r requirements.txt"
+  },
+  "deploy": {
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "healthcheckPath": "/healthz"
+  },
+  "nixpacks": {
+    "buildCommand": "cd password-manager-cloud && pip install --no-cache-dir -r requirements.txt",
+    "devServerCommand": "cd password-manager-cloud && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2",
+    "installCommand": "cd password-manager-cloud && pip install --no-cache-dir -r requirements.txt"
+  },
+  "volumes": [
+    {
+      "name": "vault-data",
+      "mountPath": "/data"
+    }
+  ]
+}
