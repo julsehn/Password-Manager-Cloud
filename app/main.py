@@ -1,5 +1,6 @@
 """Password Manager Cloud API - FastAPI Backend for Railway"""
 import os
+import re
 import sqlite3
 import hashlib
 import hmac
@@ -272,14 +273,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS middleware - allow connections from the desktop app
+# CORS middleware - official cloud: allow connections from web clients
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://password-manager-cloud.*.up.railway.app",
-        "https://*.up.railway.app",
-        "http://localhost:8000",  # For development
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
