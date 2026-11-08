@@ -1,105 +1,58 @@
-"""Password Manager Cloud API - FastAPI Backend for Railway"""
+"""Password Manager Cloud API - FastAPI Backend for Railway.
+
+Official Cloud synchronization backend:
+- Zero-knowledge storage: only stores encrypted blobs and user authentication credentials.
+- Client-side encryption ensures user passwords are never known by the server.
+"""
 import os
 import re
 import sqlite3
 import hashlib
 import hmac
-import base64
 import secrets
-import json
 from contextlib import closing
-from typing import Optional, Tuple
-from fastapi import FastAPI, HTTPException, Depends, Header, status, Request
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import jwt
 
-# Add encryption utils
-from app.utils.encryption import (
-    serialize_vault,
-    deserialize_vault,
-    encrypt,
-    decrypt,
-    derive_key,
-)
-from app.models import VaultEntry
-
-# JWT Configuration
-SECRET_KEY = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
+# JWT & Security Configuration
+SECRET_KEY = os.environ.get("SESSION_SECRET") or os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SESSION_SECRET must be configured before starting the cloud API")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+ACCESS_TOKEN_EXPIRE_DAYS = 30
 
-# Vault configuration
-DB_DIR = Path(os.environ.get("DB_DIR", "/data"))
+# Database Configuration
+raw_db_dir = os.environ.get("DB_DIR", "/data" if os.path.exists("/data") else ".")
+DB_DIR = Path(raw_db_dir)
+try:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    DB_DIR = Path(".")
 DB_PATH = DB_DIR / "vaults.db"
+
 MAX_BLOB_BYTES = int(os.environ.get("MAX_BLOB_BYTES", str(10 * 1024 * 1024)))
-VAULT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+VAULT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create a JWT access token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+def get_db_connection() -> sqlite3.Connection:
+    """Get a database connection with WAL mode."""
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
-def decode_token(token: str) -> dict:
-    """Decode and validate a JWT token."""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def verify_user(username: str, password: str) -> Optional[dict]:
-    """Verify username/password and return user data if valid."""
-    with closing(_get_connection()) as connection:
-        row = connection.execute(
-            "SELECT * FROM users WHERE username = ? AND password_hash = ?",
-            (username, hashlib.sha256(password.encode()).hexdigest()),
-        ).fetchone()
-        return row
-
-
-class VaultStorage:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _get_connection(self):
-        """Get a database connection with WAL mode for better concurrency."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        
-        # Create tables if they don't exist
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vaults (
-                vault_id TEXT PRIMARY KEY,
-                token_digest TEXT NOT NULL,
-                blob TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                updated_at TEXT NOT NULL,
-                user_id TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
+def init_db():
+    """Initialize database tables with automatic migration."""
+    with closing(get_db_connection()) as conn:
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,184 +63,230 @@ class VaultStorage:
             )
             """
         )
-        return connection
-
-
-class VaultStorage:
-
-    """Persistent SQLite storage for vaults with token-based authentication"""
-
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _get_connection(self):
-        """Get a database connection with WAL mode for better concurrency."""
-        # Create parent directory if it doesn't exist
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        
-        # Create tables if they don't exist
-        connection.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS vaults (
                 vault_id TEXT PRIMARY KEY,
+                user_id INTEGER,
                 token_digest TEXT NOT NULL,
                 blob TEXT NOT NULL,
-                version INTEGER NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             )
             """
         )
-        return connection
+        # Check if user_id column exists
+        cursor = conn.execute("PRAGMA table_info(vaults)")
+        cols = [row["name"] for row in cursor.fetchall()]
+        if "user_id" not in cols:
+            conn.execute("ALTER TABLE vaults ADD COLUMN user_id INTEGER DEFAULT 1")
+        conn.commit()
 
-    def create_vault(self, vault_id: str, user_id: int, blob: str) -> dict:
-        """Register a new vault"""
-        if vault_id in self._vaults():
-            raise HTTPException(status_code=409, detail="Vault already exists")
 
+# Run DB initialization
+init_db()
+
+
+def hash_password(password: str) -> str:
+    """Hash password using PBKDF2-HMAC-SHA256 with random salt."""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return f"pbkdf2:sha256:100000${salt}${dk.hex()}"
+
+
+def verify_password(plain_password: str, stored_hash: str) -> bool:
+    """Verify password supporting PBKDF2 and backwards-compatible plain SHA-256."""
+    if stored_hash.startswith("pbkdf2:sha256:"):
+        try:
+            parts = stored_hash.split("$")
+            iterations = int(parts[0].split(":")[-1])
+            salt = parts[1]
+            expected_dk = parts[2]
+            dk = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt.encode("utf-8"), iterations)
+            return hmac.compare_digest(dk.hex(), expected_dk)
+        except Exception:
+            return False
+    # Backwards compatibility with plain SHA256
+    sha = hashlib.sha256(plain_password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(sha, stored_hash)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """Create a JWT access token."""
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str) -> dict:
+    """Decode and validate a JWT token."""
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="El token ha caducat")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invàlid")
+
+
+def get_user_by_username(username: str) -> Optional[dict]:
+    with closing(get_db_connection()) as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_id(user_id: int) -> Optional[dict]:
+    with closing(get_db_connection()) as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def compute_user_vault_id(user_id: int, username: str) -> str:
+    """Compute default deterministic vault_id for user if none exists."""
+    with closing(get_db_connection()) as conn:
+        row = conn.execute("SELECT vault_id FROM vaults WHERE user_id = ? ORDER BY version DESC LIMIT 1", (user_id,)).fetchone()
+        if row:
+            return row["vault_id"]
+    derived = hashlib.sha256(f"user_{user_id}_{username}".encode("utf-8")).hexdigest()[:24]
+    return f"vault_{derived}"
+
+
+# Storage Manager
+class VaultStorage:
+    def __init__(self):
+        pass
+
+    def get_vault_by_user_id(self, user_id: int) -> Optional[dict]:
+        with closing(get_db_connection()) as conn:
+            row = conn.execute("SELECT * FROM vaults WHERE user_id = ? ORDER BY version DESC LIMIT 1", (user_id,)).fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def get_vault_by_id(self, vault_id: str, user_id: Optional[int] = None) -> Optional[dict]:
+        with closing(get_db_connection()) as conn:
+            row = conn.execute("SELECT * FROM vaults WHERE vault_id = ?", (vault_id,)).fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            if user_id is not None and res.get("user_id") and res["user_id"] != user_id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tens permís per accedir a aquesta caixa forta")
+            return res
+
+    def upsert_vault(self, vault_id: str, blob: str, user_id: int, expected_version: Optional[int] = None) -> dict:
         now = datetime.now(timezone.utc).isoformat()
-        user_digest = self._user_digest(user_id)
+        token_digest = hashlib.sha256(str(user_id).encode()).hexdigest()
 
-        with closing(self._get_connection()) as connection:
-            connection.execute(
-                """
-                INSERT INTO vaults (vault_id, token_digest, blob, version, updated_at, user_id)
-                VALUES (?, ?, ?, 1, ?, ?)
-                """,
-                (vault_id, user_digest, blob, now, user_id),
-            )
-            connection.commit()
+        with closing(get_db_connection()) as conn:
+            current = conn.execute("SELECT * FROM vaults WHERE vault_id = ?", (vault_id,)).fetchone()
+            if current:
+                curr_user = current["user_id"]
+                if curr_user is not None and curr_user != user_id:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="La caixa forta pertany a un altre usuari")
 
-        return {
-            "vault_id": vault_id,
-            "blob": blob,
-            "version": 1,
-            "updated_at": now,
-        }
+                if expected_version is not None and current["version"] != expected_version:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Conflicte de versió: s'esperava {expected_version}, es té {current['version']}"
+                    )
 
-    def get_vault(self, vault_id: str, user_id: int) -> dict:
-        """Get vault by ID with user verification"""
-        if vault_id not in self._vaults():
-            raise HTTPException(status_code=404, detail="Vault not found")
+                new_version = current["version"] + 1
+                conn.execute(
+                    "UPDATE vaults SET blob = ?, version = ?, updated_at = ?, user_id = ? WHERE vault_id = ?",
+                    (blob, new_version, now, user_id, vault_id)
+                )
+                conn.commit()
+                return {
+                    "vault_id": vault_id,
+                    "blob": blob,
+                    "version": new_version,
+                    "updated_at": now
+                }
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO vaults (vault_id, token_digest, blob, version, updated_at, user_id)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                    """,
+                    (vault_id, token_digest, blob, now, user_id)
+                )
+                conn.commit()
+                return {
+                    "vault_id": vault_id,
+                    "blob": blob,
+                    "version": 1,
+                    "updated_at": now
+                }
 
-        user_digest = self._user_digest(user_id)
-
-        with closing(self._get_connection()) as connection:
-            row = connection.execute(
-                "SELECT * FROM vaults WHERE vault_id = ?",
-                (vault_id,),
-            ).fetchone()
-
-            if row is None or not hmac.compare_digest(row["token_digest"], user_digest) or row["user_id"] != user_id:
-                raise HTTPException(status_code=404, detail="Vault not found")
-
-            return {
-                "vault_id": row["vault_id"],
-                "blob": row["blob"],
-                "version": row["version"],
-                "updated_at": row["updated_at"],
-            }
-
-    def update_vault(self, vault_id: str, blob: str, user_id: int, expected_version: Optional[int] = None) -> dict:
-        """Update vault with optimistic version checking"""
-        if vault_id not in self._vaults():
-            raise HTTPException(status_code=404, detail="Vault not found")
-
-        current = self.get_vault(vault_id, user_id)
-
-        # Version conflict check
-        if expected_version is not None and current["version"] != expected_version:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Version conflict: expected {expected_version}, got {current['version']}"
-            )
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        with closing(self._get_connection()) as connection:
-            connection.execute(
-                """
-                UPDATE vaults
-                SET blob = ?, version = version + 1, updated_at = ?
-                WHERE vault_id = ? AND user_id = ?
-                """,
-                (blob, now, vault_id, user_id),
-            )
-            connection.commit()
-
-        # Get updated version
-        with closing(self._get_connection()) as connection:
-            row = connection.execute(
-                "SELECT version FROM vaults WHERE vault_id = ?",
-                (vault_id,),
-            ).fetchone()
-            new_version = row["version"]
-
-        return {
-            "vault_id": vault_id,
-            "blob": blob,
-            "version": new_version,
-            "updated_at": now,
-        }
-
-    def delete_vault(self, vault_id: str, user_id: int) -> None:
-        """Delete vault by ID"""
-        if vault_id not in self._vaults():
-            raise HTTPException(status_code=404, detail="Vault not found")
-
-        with closing(self._get_connection()) as connection:
-            connection.execute("DELETE FROM vaults WHERE vault_id = ? AND user_id = ?", (vault_id, user_id))
-            connection.commit()
-
-    def _vaults(self) -> dict:
-        """Get all vault IDs (for checking existence)"""
-        with closing(_get_connection()) as connection:
-            rows = connection.execute("SELECT vault_id FROM vaults").fetchall()
-            return {row["vault_id"] for row in rows}
-
-    def _user_digest(self, user_id: int) -> str:
-        """Create SHA256 digest of user_id for secure comparison"""
-        return hashlib.sha256(str(user_id).encode()).hexdigest()
-
-    def _get_user_by_username(self, username: str) -> dict | None:
-        """Get user by username"""
-        with closing(_get_connection()) as connection:
-            row = connection.execute(
-                "SELECT * FROM users WHERE username = ?",
-                (username,)
-            ).fetchone()
-            return dict(row) if row else None
+    def delete_vault(self, vault_id: str, user_id: int) -> bool:
+        with closing(get_db_connection()) as conn:
+            current = conn.execute("SELECT * FROM vaults WHERE vault_id = ?", (vault_id,)).fetchone()
+            if not current:
+                return False
+            if current["user_id"] is not None and current["user_id"] != user_id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tens permís per eliminar aquesta caixa forta")
+            conn.execute("DELETE FROM vaults WHERE vault_id = ?", (vault_id,))
+            conn.commit()
+            return True
 
 
-# Initialize storage with persistent SQLite database
-vault_storage = VaultStorage(DB_PATH)
+vault_storage = VaultStorage()
 
-# Create FastAPI app
+# App Definition
 app = FastAPI(
-    title="Password Manager Cloud API",
-    description="Secure vault storage for password manager synchronization",
-    version="1.0.0",
+    title="Caixa Forta Cloud API",
+    description="Oficial Railway Synchronization Backend - Zero-knowledge encrypted vault storage",
+    version="1.1.0",
 )
 
-# CORS middleware - official cloud: allow connections from web clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["*"],
 )
 
 security = HTTPBearer(auto_error=False)
 
 
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> dict:
+    """Validate Bearer JWT token and return authenticated user."""
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Autenticació requerida (falta token Bearer)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    payload = decode_token(token)
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token no vàlid")
+    user = get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuari no trobat")
+    return user
+
+
+def validate_vault_id(vault_id: str) -> str:
+    if not VAULT_ID_PATTERN.fullmatch(vault_id):
+        raise HTTPException(status_code=400, detail="Format d'identificador de caixa forta invàlid")
+    return vault_id
+
+
+def check_blob_size(blob: str) -> None:
+    if len(blob.encode("utf-8")) > MAX_BLOB_BYTES:
+        raise HTTPException(status_code=413, detail="La caixa forta encriptada és massa gran")
+
+
+# Request & Response Models
 class RegisterVaultRequest(BaseModel):
     vault_id: str = Field(..., min_length=1)
     blob: str = Field(...)
+    token: Optional[str] = None
 
 
 class GetVaultResponse(BaseModel):
@@ -300,102 +299,6 @@ class GetVaultResponse(BaseModel):
 class VaultBlobRequest(BaseModel):
     blob: str = Field(...)
     expected_version: Optional[int] = Field(default=None, ge=0)
-
-
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {"status": "ok", "service": "Password Manager Cloud API"}
-
-
-@app.post("/v1/vaults", response_model=GetVaultResponse, status_code=status.HTTP_201_CREATED)
-async def register_vault(
-    request: RegisterVaultRequest,
-    user: dict = Depends(get_current_user),
-):
-    """Register a new vault on the server"""
-    try:
-        validate_vault_id(request.vault_id)
-        check_blob_size(request.blob)
-        vault = vault_storage.create_vault(
-            vault_id=request.vault_id,
-            user_id=user["id"],
-            blob=request.blob,
-        )
-        return GetVaultResponse(
-            vault_id=vault["vault_id"],
-            blob=vault["blob"],
-            version=vault["version"],
-            updated_at=vault["updated_at"],
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create vault: {str(e)}")
-
-
-@app.get("/v1/vaults/{vault_id}", response_model=GetVaultResponse)
-async def get_vault(
-    vault_id: str,
-    user: dict = Depends(get_current_user),
-):
-    """Download the current vault state"""
-    try:
-        vault = vault_storage.get_vault(
-            vault_id=validate_vault_id(vault_id),
-            user_id=user["id"],
-        )
-        return GetVaultResponse(
-            vault_id=vault["vault_id"],
-            blob=vault["blob"],
-            version=vault["version"],
-            updated_at=vault["updated_at"],
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve vault: {str(e)}")
-
-
-@app.put("/v1/vaults/{vault_id}", response_model=GetVaultResponse)
-async def upload_vault(
-    payload: VaultBlobRequest,
-    vault_id: str,
-    user: dict = Depends(get_current_user),
-):
-    """Upload a new version of the vault blob"""
-    try:
-        vault = vault_storage.update_vault(
-            vault_id=validate_vault_id(vault_id),
-            blob=payload.blob,
-            user_id=user["id"],
-            expected_version=payload.expected_version,
-        )
-        return GetVaultResponse(
-            vault_id=vault["vault_id"],
-            blob=vault["blob"],
-            version=vault["version"],
-            updated_at=vault["updated_at"],
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update vault: {str(e)}")
-
-
-@app.delete("/v1/vaults/{vault_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_vault(
-    vault_id: str,
-    user: dict = Depends(get_current_user),
-):
-    """Delete the vault from the server"""
-    try:
-        vault_storage.delete_vault(vault_id, user["id"])
-        return {"status": "deleted", "vault_id": vault_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete vault: {str(e)}")
 
 
 class UserRegisterRequest(BaseModel):
@@ -414,111 +317,197 @@ class UserResponse(BaseModel):
     username: str
     email: Optional[str] = None
     access_token: str
+    vault_id: str
     token_type: str = "bearer"
+
+
+# Routes
+@app.get("/")
+@app.get("/healthz")
+async def health_check():
+    """Health check endpoint for Railway and clients."""
+    return {"status": "ok", "service": "Caixa Forta Cloud API (Railway)", "version": "1.1.0"}
 
 
 @app.post("/v1/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register_user(request: UserRegisterRequest):
-    """Register a new user."""
-    with closing(_get_connection()) as connection:
-        # Check if username exists
-        existing = connection.execute(
-            "SELECT * FROM users WHERE username = ?",
-            (request.username,)
-        ).fetchone()
-        if existing:
-            raise HTTPException(status_code=409, detail="Username already exists")
-        
-        # Create user
-        now = datetime.now(timezone.utc).isoformat()
-        password_hash = hashlib.sha256(request.password.encode()).hexdigest()
-        connection.execute(
+    """Register a new user account on the official Railway cloud."""
+    existing = get_user_by_username(request.username)
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aquest nom d'usuari ja existeix")
+
+    now = datetime.now(timezone.utc).isoformat()
+    p_hash = hash_password(request.password)
+
+    with closing(get_db_connection()) as conn:
+        cursor = conn.execute(
             "INSERT INTO users (username, password_hash, email, created_at) VALUES (?, ?, ?, ?)",
-            (request.username, password_hash, request.email, now)
+            (request.username, p_hash, request.email, now),
         )
-        connection.commit()
-        
-        # Get user ID and create access token
-        user = connection.execute(
-            "SELECT id, username, email FROM users WHERE username = ?",
-            (request.username,)
-        ).fetchone()
-        
-        token = create_access_token(data={"sub": user["username"]})
-        return UserResponse(
-            user_id=user["id"],
-            username=user["username"],
-            email=user["email"],
-            access_token=token
-        )
+        conn.commit()
+        user_id = cursor.lastrowid
+
+    token = create_access_token(data={"sub": request.username})
+    vault_id = compute_user_vault_id(user_id, request.username)
+
+    return UserResponse(
+        user_id=user_id,
+        username=request.username,
+        email=request.email,
+        access_token=token,
+        vault_id=vault_id,
+        token_type="bearer",
+    )
 
 
 @app.post("/v1/auth/login", response_model=UserResponse)
 async def login_user(request: UserLoginRequest):
-    """Login and get access token."""
-    user_data = verify_user(request.username, request.password)
-    if not user_data:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    token = create_access_token(data={"sub": user_data["username"]})
+    """Authenticate with username and password, returning JWT access token."""
+    user = get_user_by_username(request.username)
+    if not user or not verify_password(request.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuari o contrasenya incorrectes")
+
+    token = create_access_token(data={"sub": user["username"]})
+    vault_id = compute_user_vault_id(user["id"], user["username"])
+
     return UserResponse(
-        user_id=user_data["id"],
-        username=user_data["username"],
-        email=user_data["email"],
-        access_token=token
+        user_id=user["id"],
+        username=user["username"],
+        email=user["email"],
+        access_token=token,
+        vault_id=vault_id,
+        token_type="bearer",
     )
 
 
 @app.get("/v1/auth/me")
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))
+async def get_me(user: dict = Depends(get_current_user)):
+    """Get current authenticated user info and associated vault."""
+    vault_id = compute_user_vault_id(user["id"], user["username"])
+    vault = vault_storage.get_vault_by_user_id(user["id"])
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "email": user["email"],
+        "vault_id": vault_id,
+        "has_vault": vault is not None,
+        "vault_version": vault["version"] if vault else 0,
+        "updated_at": vault["updated_at"] if vault else None,
+    }
+
+
+# User-centric vault endpoints (no manual vault_id needed!)
+@app.get("/v1/vault", response_model=GetVaultResponse)
+async def get_my_vault(user: dict = Depends(get_current_user)):
+    """Retrieve the current user's encrypted vault."""
+    vault = vault_storage.get_vault_by_user_id(user["id"])
+    if not vault:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Encara no hi ha cap caixa forta desada per aquest usuari")
+    return GetVaultResponse(
+        vault_id=vault["vault_id"],
+        blob=vault["blob"],
+        version=vault["version"],
+        updated_at=vault["updated_at"],
+    )
+
+
+@app.put("/v1/vault", response_model=GetVaultResponse)
+async def upload_my_vault(
+    payload: VaultBlobRequest,
+    user: dict = Depends(get_current_user),
 ):
-    """Get current authenticated user info."""
-    try:
-        payload = decode_token(credentials.credentials)
-        user = vault_storage._get_user_by_username(payload["sub"])
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        return {
-            "user_id": user["id"],
-            "username": user["username"],
-            "email": user["email"]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get user: {str(e)}")
+    """Upload or sync the current user's encrypted vault."""
+    check_blob_size(payload.blob)
+    vault_id = compute_user_vault_id(user["id"], user["username"])
+    vault = vault_storage.upsert_vault(
+        vault_id=vault_id,
+        blob=payload.blob,
+        user_id=user["id"],
+        expected_version=payload.expected_version,
+    )
+    return GetVaultResponse(
+        vault_id=vault["vault_id"],
+        blob=vault["blob"],
+        version=vault["version"],
+        updated_at=vault["updated_at"],
+    )
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-) -> dict:
-    """Validate Bearer token and return user data"""
-    if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authentication")
-    try:
-        payload = decode_token(credentials.credentials)
-        user = vault_storage._get_user_by_username(payload["sub"])
-        if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid user")
-        return user
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Authentication failed: {str(e)}")
+# Explicit vault_id endpoints (backwards compatible)
+@app.post("/v1/vaults", response_model=GetVaultResponse, status_code=status.HTTP_201_CREATED)
+async def register_vault(
+    request: RegisterVaultRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Register or initialize a vault with a specific ID."""
+    v_id = validate_vault_id(request.vault_id)
+    check_blob_size(request.blob)
+    vault = vault_storage.upsert_vault(
+        vault_id=v_id,
+        blob=request.blob,
+        user_id=user["id"],
+        expected_version=None,
+    )
+    return GetVaultResponse(
+        vault_id=vault["vault_id"],
+        blob=vault["blob"],
+        version=vault["version"],
+        updated_at=vault["updated_at"],
+    )
 
 
-def validate_vault_id(vault_id: str) -> str:
-    """Validate vault ID format and return it"""
-    if not VAULT_ID_PATTERN.fullmatch(vault_id):
-        raise HTTPException(status_code=400, detail="Invalid vault id format")
-    return vault_id
+@app.get("/v1/vaults/{vault_id}", response_model=GetVaultResponse)
+async def get_vault(
+    vault_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Download encrypted vault by ID."""
+    v_id = validate_vault_id(vault_id)
+    vault = vault_storage.get_vault_by_id(v_id, user_id=user["id"])
+    if not vault:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Caixa forta no trobada")
+    return GetVaultResponse(
+        vault_id=vault["vault_id"],
+        blob=vault["blob"],
+        version=vault["version"],
+        updated_at=vault["updated_at"],
+    )
 
 
-def check_blob_size(blob: str) -> None:
-    """Check if blob size exceeds maximum"""
-    if len(blob.encode("utf-8")) > MAX_BLOB_BYTES:
-        raise HTTPException(status_code=413, detail="Encrypted vault is too large")
+@app.put("/v1/vaults/{vault_id}", response_model=GetVaultResponse)
+async def upload_vault(
+    payload: VaultBlobRequest,
+    vault_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Upload or update encrypted vault by ID."""
+    v_id = validate_vault_id(vault_id)
+    check_blob_size(payload.blob)
+    vault = vault_storage.upsert_vault(
+        vault_id=v_id,
+        blob=payload.blob,
+        user_id=user["id"],
+        expected_version=payload.expected_version,
+    )
+    return GetVaultResponse(
+        vault_id=vault["vault_id"],
+        blob=vault["blob"],
+        version=vault["version"],
+        updated_at=vault["updated_at"],
+    )
+
+
+@app.delete("/v1/vaults/{vault_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_vault(
+    vault_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Delete a vault from Railway cloud."""
+    v_id = validate_vault_id(vault_id)
+    deleted = vault_storage.delete_vault(v_id, user["id"])
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Caixa forta no trobada")
+    return None
 
 
 if __name__ == "__main__":

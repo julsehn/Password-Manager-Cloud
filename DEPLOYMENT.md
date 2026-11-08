@@ -27,6 +27,7 @@ Un cop desplegat, verifica que l'estat sigui "Running" o "Success" a la dashboar
 ### 4. Obtingues l'URL del Servidor
 
 Un cop desplegat, veuràs l'URL de producció a la dashboard de Railway:
+
 ```
 https://password-manager-cloud-<random>.up.railway.app
 ```
@@ -42,15 +43,16 @@ Obre http://your-project-name.up.railway.app i hauries de veure:
 }
 ```
 
-### 6. Configura Variables d'Entorn (Opcional)
+### 6. Configura Variables d'Entorn
 
 Si vols variar el port o altres configuracions, afegeix variables d'entorn:
 
 1. A Railway Dashboard, va al teu servei
 2. Anota "Variables"
 3. Afegeix si cal:
-   - `MAX_BLOB_BYTES`: 10485760 (default 10MB, en bytes)
-   - `SECRET_KEY`: (opcional, per a tokens JWT futurs)
+
+- `SESSION_SECRET`: clau aleatòria estable per signar els tokens d'accés del compte
+- `MAX_BLOB_BYTES`: 10485760 (default 10MB, en bytes)
 
 ## Verifica el Desplegament
 

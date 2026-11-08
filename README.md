@@ -18,6 +18,7 @@ This service provides a REST API for storing and retrieving encrypted vaults. Al
 ## API Endpoints
 
 ### Register Vault
+
 ```http
 POST /v1/vaults
 Content-Type: application/json
@@ -28,16 +29,20 @@ Content-Type: application/json
   "blob": "encrypted-vault-blob"
 }
 ```
+
 Creates a new vault with the provided encrypted blob.
 
 ### Download Vault
+
 ```http
 GET /v1/vaults/{vault_id}
 Authorization: Bearer {token}
 ```
+
 Retrieves the current vault state. Requires valid Bearer token.
 
 ### Upload Vault
+
 ```http
 PUT /v1/vaults/{vault_id}
 Content-Type: application/json
@@ -49,31 +54,39 @@ Authorization: Bearer {token}
   "expected_version": 1
 }
 ```
+
 Uploads a new version of the vault with optimistic version checking.
 
 ### Delete Vault
+
 ```http
 DELETE /v1/vaults/{vault_id}
 Authorization: Bearer {token}
 ```
+
 Deletes the vault from the server.
 
 ## Deployment
 
 ### Railway
+
 1. Create a new Railway project
 2. Connect this repository
 3. Railway will automatically create persistent volumes for `/data`
-4. Environment variables (optional for production):
-   - `SECRET_KEY`: For JWT signing (reserved for future use)
-   - `CORS_ORIGINS`: Comma-separated list of allowed origins
-   - `MAX_BLOB_BYTES`: Maximum vault size in bytes (default: 10MB)
+4. Set `SESSION_SECRET` to a random secret used to sign account access tokens.
+   Keep it stable across deployments; rotating it signs out existing sessions.
+
+- `CLOUD_URL`: Optional public API URL used by the desktop client
+- `CORS_ORIGINS`: Comma-separated list of allowed origins
+- `MAX_BLOB_BYTES`: Maximum vault size in bytes (default: 10MB)
+
 5. Deploy
 
 ### Docker
+
 ```bash
 docker build -t password-manager-cloud .
-docker run -p 8000:8000 -v $(pwd)/data:/data password-manager-cloud
+docker run -p 8000:8000 -e SESSION_SECRET="$SESSION_SECRET" -v $(pwd)/data:/data password-manager-cloud
 ```
 
 ## Development
