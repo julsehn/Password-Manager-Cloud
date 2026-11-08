@@ -8,24 +8,33 @@ import os
 import re
 import sqlite3
 import hashlib
-import hmac
 import secrets
+import time
+from collections import defaultdict, deque
 from contextlib import closing
+from threading import Lock
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import jwt
+from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
 # JWT & Security Configuration
 SECRET_KEY = os.environ.get("SESSION_SECRET") or os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("SESSION_SECRET must be configured before starting the cloud API")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_DAYS = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+AUTH_RATE_LIMIT = 10
+AUTH_RATE_WINDOW_SECONDS = 900
+_auth_attempts: dict[str, deque[float]] = defaultdict(deque)
+_auth_attempts_lock = Lock()
 
 # Database Configuration
 raw_db_dir = os.environ.get("DB_DIR", "/data" if os.path.exists("/data") else ".")
@@ -59,6 +68,7 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 email TEXT,
+                token_version INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
@@ -80,6 +90,21 @@ def init_db():
         cols = [row["name"] for row in cursor.fetchall()]
         if "user_id" not in cols:
             conn.execute("ALTER TABLE vaults ADD COLUMN user_id INTEGER DEFAULT 1")
+        user_cols = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "token_version" not in user_cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            )
+            """
+        )
         conn.commit()
 
 
@@ -88,35 +113,58 @@ init_db()
 
 
 def hash_password(password: str) -> str:
-    """Hash password using PBKDF2-HMAC-SHA256 with random salt."""
-    salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
-    return f"pbkdf2:sha256:100000${salt}${dk.hex()}"
+    """Hash account passwords with Argon2id."""
+    return PASSWORD_HASHER.hash(password)
 
 
 def verify_password(plain_password: str, stored_hash: str) -> bool:
-    """Verify password supporting PBKDF2 and backwards-compatible plain SHA-256."""
-    if stored_hash.startswith("pbkdf2:sha256:"):
+    """Verify Argon2id account password hashes."""
+    if stored_hash.startswith("$argon2id$"):
         try:
-            parts = stored_hash.split("$")
-            iterations = int(parts[0].split(":")[-1])
-            salt = parts[1]
-            expected_dk = parts[2]
-            dk = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt.encode("utf-8"), iterations)
-            return hmac.compare_digest(dk.hex(), expected_dk)
-        except Exception:
+            return PASSWORD_HASHER.verify(stored_hash, plain_password)
+        except argon2_exceptions.VerificationError:
             return False
-    # Backwards compatibility with plain SHA256
-    sha = hashlib.sha256(plain_password.encode("utf-8")).hexdigest()
-    return hmac.compare_digest(sha, stored_hash)
+    return False
+
+
+def enforce_auth_rate_limit(key: str) -> None:
+    now = time.monotonic()
+    with _auth_attempts_lock:
+        attempts = _auth_attempts[key]
+        while attempts and now - attempts[0] >= AUTH_RATE_WINDOW_SECONDS:
+            attempts.popleft()
+        if len(attempts) >= AUTH_RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="Massa intents. Torna-ho a provar més tard.")
+        attempts.append(now)
+
+        for stale_key in [
+            existing for existing, values in _auth_attempts.items()
+            if not values or now - values[-1] >= AUTH_RATE_WINDOW_SECONDS
+        ]:
+            _auth_attempts.pop(stale_key, None)
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create a JWT access token."""
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS))
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token(user_id: int) -> str:
+    token = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = int(time.time()) + REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+    with closing(get_db_connection()) as conn:
+        conn.execute(
+            "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+            (token_hash, user_id, expires_at),
+        )
+        conn.commit()
+    return token
 
 
 def decode_token(token: str) -> dict:
@@ -175,7 +223,7 @@ class VaultStorage:
 
     def upsert_vault(self, vault_id: str, blob: str, user_id: int, expected_version: Optional[int] = None) -> dict:
         now = datetime.now(timezone.utc).isoformat()
-        token_digest = hashlib.sha256(str(user_id).encode()).hexdigest()
+        token_digest = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
 
         with closing(get_db_connection()) as conn:
             current = conn.execute("SELECT * FROM vaults WHERE vault_id = ?", (vault_id,)).fetchone()
@@ -239,13 +287,19 @@ app = FastAPI(
     version="1.1.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 security = HTTPBearer(auto_error=False)
 
@@ -268,6 +322,8 @@ async def get_current_user(
     user = get_user_by_username(username)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuari no trobat")
+    if payload.get("ver") != user.get("token_version", 0):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sessió revocada")
     return user
 
 
@@ -312,11 +368,16 @@ class UserLoginRequest(BaseModel):
     password: str = Field(...)
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=32, max_length=256)
+
+
 class UserResponse(BaseModel):
     user_id: int
     username: str
     email: Optional[str] = None
     access_token: str
+    refresh_token: str
     vault_id: str
     token_type: str = "bearer"
 
@@ -330,44 +391,53 @@ async def health_check():
 
 
 @app.post("/v1/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register_user(request: UserRegisterRequest):
+async def register_user(payload: UserRegisterRequest, http_request: Request):
     """Register a new user account on the official Railway cloud."""
-    existing = get_user_by_username(request.username)
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    enforce_auth_rate_limit(f"register:{client_ip}")
+    existing = get_user_by_username(payload.username)
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aquest nom d'usuari ja existeix")
 
     now = datetime.now(timezone.utc).isoformat()
-    p_hash = hash_password(request.password)
+    p_hash = hash_password(payload.password)
 
     with closing(get_db_connection()) as conn:
         cursor = conn.execute(
             "INSERT INTO users (username, password_hash, email, created_at) VALUES (?, ?, ?, ?)",
-            (request.username, p_hash, request.email, now),
+            (payload.username, p_hash, payload.email, now),
         )
         conn.commit()
         user_id = cursor.lastrowid
 
-    token = create_access_token(data={"sub": request.username})
-    vault_id = compute_user_vault_id(user_id, request.username)
+    token = create_access_token(data={"sub": payload.username, "ver": 0})
+    refresh_token = create_refresh_token(user_id)
+    vault_id = compute_user_vault_id(user_id, payload.username)
 
     return UserResponse(
         user_id=user_id,
-        username=request.username,
-        email=request.email,
+        username=payload.username,
+        email=payload.email,
         access_token=token,
+        refresh_token=refresh_token,
         vault_id=vault_id,
         token_type="bearer",
     )
 
 
 @app.post("/v1/auth/login", response_model=UserResponse)
-async def login_user(request: UserLoginRequest):
+async def login_user(payload: UserLoginRequest, http_request: Request):
     """Authenticate with username and password, returning JWT access token."""
-    user = get_user_by_username(request.username)
-    if not user or not verify_password(request.password, user["password_hash"]):
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    enforce_auth_rate_limit(f"login:{client_ip}:{payload.username.casefold()}")
+    user = get_user_by_username(payload.username)
+    if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuari o contrasenya incorrectes")
 
-    token = create_access_token(data={"sub": user["username"]})
+    token = create_access_token(
+        data={"sub": user["username"], "ver": user.get("token_version", 0)}
+    )
+    refresh_token = create_refresh_token(user["id"])
     vault_id = compute_user_vault_id(user["id"], user["username"])
 
     return UserResponse(
@@ -375,9 +445,58 @@ async def login_user(request: UserLoginRequest):
         username=user["username"],
         email=user["email"],
         access_token=token,
+        refresh_token=refresh_token,
         vault_id=vault_id,
         token_type="bearer",
     )
+
+
+@app.post("/v1/auth/refresh", response_model=UserResponse)
+async def refresh_access_token(payload: RefreshTokenRequest, http_request: Request):
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    enforce_auth_rate_limit(f"refresh:{client_ip}")
+    token_hash = hashlib.sha256(payload.refresh_token.encode("utf-8")).hexdigest()
+    with closing(get_db_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM refresh_tokens WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+    if not row or row["revoked_at"] is not None or row["expires_at"] <= int(time.time()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token invàlid")
+    user = get_user_by_id(row["user_id"])
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuari no trobat")
+    return UserResponse(
+        user_id=user["id"],
+        username=user["username"],
+        email=user["email"],
+        access_token=create_access_token(
+            data={"sub": user["username"], "ver": user.get("token_version", 0)}
+        ),
+        refresh_token=payload.refresh_token,
+        vault_id=compute_user_vault_id(user["id"], user["username"]),
+        token_type="bearer",
+    )
+
+
+@app.post("/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_refresh_token(payload: RefreshTokenRequest):
+    token_hash = hashlib.sha256(payload.refresh_token.encode("utf-8")).hexdigest()
+    now = int(time.time())
+    with closing(get_db_connection()) as conn:
+        row = conn.execute(
+            "SELECT user_id FROM refresh_tokens WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+                (now, row["user_id"]),
+            )
+            conn.execute(
+                "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+                (row["user_id"],),
+            )
+            conn.commit()
+    return None
 
 
 @app.get("/v1/auth/me")
