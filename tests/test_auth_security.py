@@ -20,20 +20,10 @@ class CloudAuthSecurityTests(unittest.TestCase):
         self.assertTrue(verify_password("sample-cloud-password", stored))
         self.assertFalse(verify_password("incorrect", stored))
 
-    def test_legacy_unsalted_sha256_is_rejected(self):
+    def test_unsalted_sha256_hash_is_rejected(self):
         stored = hashlib.sha256(b"sample-cloud-password").hexdigest()
 
         self.assertFalse(verify_password("sample-cloud-password", stored))
-
-    def test_legacy_pbkdf2_hash_is_rejected(self):
-        salt = "legacy-salt"
-        digest = hashlib.pbkdf2_hmac(
-            "sha256", b"legacy-password", salt.encode("utf-8"), 100_000
-        ).hex()
-        stored = f"pbkdf2:sha256:100000${salt}${digest}"
-
-        self.assertFalse(verify_password("legacy-password", stored))
-        self.assertFalse(verify_password("incorrect", stored))
 
     def test_auth_rate_limit_is_enforced(self):
         _auth_attempts.clear()

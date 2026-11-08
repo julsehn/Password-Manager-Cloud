@@ -6,12 +6,13 @@ from typing import List
 from datetime import datetime, timezone
 import uuid
 from dataclasses import dataclass, field
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
+from argon2.low_level import Type, hash_secret_raw
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-# Minimum iterations per OWASP 2023 guidelines
-DEFAULT_ITERATIONS = 600_000
+ARGON2_MEMORY_COST_KIB = 19 * 1024
+ARGON2_TIME_COST = 2
+ARGON2_PARALLELISM = 1
+KEY_LENGTH = 32
 
 
 @dataclass
@@ -48,18 +49,26 @@ class PasswordEntry:
         return e
 
 
-def derive_key(password: str, salt: bytes | None = None, iterations: int = DEFAULT_ITERATIONS) -> tuple[bytes, bytes]:
-    """Derive a 32-byte key from password using PBKDF2-HMAC-SHA256."""
+def derive_key(
+    password: str,
+    salt: bytes | None = None,
+) -> tuple[bytes, bytes]:
+    """Derive a 32-byte key from password using Argon2id.
+
+    Returns (key, salt). If salt is None a new random 16-byte salt is generated.
+    """
     if salt is None:
         salt = os.urandom(16)
 
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
+    key = hash_secret_raw(
+        secret=password.encode("utf-8"),
         salt=salt,
-        iterations=iterations,
+        time_cost=ARGON2_TIME_COST,
+        memory_cost=ARGON2_MEMORY_COST_KIB,
+        parallelism=ARGON2_PARALLELISM,
+        hash_len=KEY_LENGTH,
+        type=Type.ID,
     )
-    key = kdf.derive(password.encode("utf-8"))
     return key, salt
 
 

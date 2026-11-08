@@ -552,7 +552,7 @@ async def upload_my_vault(
     )
 
 
-# Explicit vault_id endpoints (backwards compatible)
+# Explicit vault_id endpoints
 @app.post("/v1/vaults", response_model=GetVaultResponse, status_code=status.HTTP_201_CREATED)
 async def register_vault(
     request: RegisterVaultRequest,

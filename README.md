@@ -8,7 +8,7 @@ This service provides a REST API for storing and retrieving encrypted vaults. Al
 
 ## Features
 
-- **End-to-End Encryption**: AES-256-GCM encryption with PBKDF2-SHA256 key derivation (600k iterations per OWASP 2023)
+- **End-to-End Encryption**: AES-256-GCM encryption with Argon2id key derivation
 - **Persistent Storage**: SQLite database with WAL mode for crash-safe operations
 - **Optimistic Locking**: Version-based conflict detection for simultaneous updates
 - **Token-based Auth**: Secure SHA256 token digests for vault access control
